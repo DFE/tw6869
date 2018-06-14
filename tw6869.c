@@ -43,6 +43,10 @@
 #include <media/v4l2-event.h>
 #include <media/videobuf2-dma-contig.h>
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
+#include <media/videobuf2-v4l2.h>
+#endif
+
 #include <sound/core.h>
 #include <sound/initval.h>
 #include <sound/pcm.h>
@@ -53,7 +57,7 @@
 MODULE_DESCRIPTION("tw6869/65 media bridge driver");
 MODULE_AUTHOR("starterkit <info@starterkit.ru>");
 MODULE_LICENSE("GPL v2");
-MODULE_VERSION("0.3.1");
+MODULE_VERSION("0.3.3");
 
 
 #define CHECK_V_PB  /* drop frames on pb failures */
@@ -224,7 +228,9 @@ struct tw6869_dev {
 	unsigned int ch_max;
 
 	struct v4l2_device v4l2_dev;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,4,0)
 	struct vb2_alloc_ctx *alloc_ctx;
+#endif
 	struct tw6869_vch vch[TW_CH_MAX];
 
 #ifdef IMPL_AUDIO
@@ -459,18 +465,30 @@ static unsigned tw6869_virq(struct tw6869_dev *dev,
 			done = vch->p_buf;
 			vch->p_buf = next;
 			addr =  R32_DMA_P_ADDR(id);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
+			to_vb2_v4l2_buffer(&done->vb)->field = V4L2_FIELD_INTERLACED;
+#else
 			done->vb.v4l2_buf.field = V4L2_FIELD_INTERLACED;
+#endif
 		}
 	}
 
 	if (done && next) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
+		to_vb2_v4l2_buffer(&done->vb)->sequence = vch->sequence++;
+#else
 		v4l2_get_timestamp(&done->vb.v4l2_buf.timestamp);
 		done->vb.v4l2_buf.sequence = vch->sequence++;
+#endif
 		tw_write(dev, addr, next->dma);
 		/* done->vb.v4l2_buf.field = (vch->std & V4L2_STD_625_50) ? V4L2_FIELD_INTERLACED_BT : V4L2_FIELD_INTERLACED_TB; */
 		spin_unlock_irqrestore(&vch->lock, flags);
 		vb2_buffer_done(&done->vb, VB2_BUF_STATE_DONE);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
+		TWINFO("vin/%u frame %u pb:%u\n", id+1, vch->sequence, pb );
+#else
 		TWINFO("vin/%u frame %u pb:%u ts:%ld.%06ld\n", id+1, vch->sequence, pb, done->vb.v4l2_buf.timestamp.tv_sec, done->vb.v4l2_buf.timestamp.tv_usec);
+#endif
 	} else {
 		++vch->dcount;
 		spin_unlock_irqrestore(&vch->lock, flags);
@@ -768,6 +786,31 @@ static void tw6869_vch_set_dma(struct tw6869_vch *vch)
 /*
  * Videobuf2 Operations
  */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
+static int queue_setup(struct vb2_queue *vq,
+		       unsigned int *nbuffers, unsigned int *nplanes,
+		       unsigned int sizes[], struct device *alloc_devs[])
+{
+	struct tw6869_vch *vch = vb2_get_drv_priv(vq);
+	struct v4l2_pix_format pix;
+	tw6869_fill_pix_format(vch, &pix);
+
+	if (vq->num_buffers + *nbuffers < TW_FRAME_MAX)
+		*nbuffers = TW_FRAME_MAX - vq->num_buffers;
+
+	if (*nplanes) {
+		if (*nplanes != 1 || sizes[0] < pix.sizeimage)
+			return -EINVAL;
+		return 0;
+	}
+
+	sizes[0] = pix.sizeimage;
+	BUG_ON( sizes[0]==0 );
+	*nplanes = 1;
+
+	return 0;
+}
+#else
 static int queue_setup(struct vb2_queue *vq, const struct v4l2_format *fmt,
 				unsigned int *nbuffers, unsigned int *nplanes,
 				unsigned int sizes[], void *alloc_ctxs[])
@@ -785,6 +828,7 @@ static int queue_setup(struct vb2_queue *vq, const struct v4l2_format *fmt,
 	alloc_ctxs[0] = dev->alloc_ctx;
 	return 0;
 }
+#endif
 
 static int buffer_init(struct vb2_buffer *vb)
 {
@@ -1406,8 +1450,10 @@ static void tw6869_video_unregister(struct tw6869_dev *dev)
 	tw_write(dev, R32_DMA_CMD, 0);
 	tw_write(dev, R32_DMA_CHANNEL_ENABLE, 0);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,4,0)
 	if (!dev->alloc_ctx)
 		return;
+#endif
 
 	if (dev->ch_max > TW_CH_MAX)
 		dev->ch_max = TW_CH_MAX;
@@ -1419,8 +1465,10 @@ static void tw6869_video_unregister(struct tw6869_dev *dev)
 	}
 
 	v4l2_device_unregister(&dev->v4l2_dev);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,4,0)
 	vb2_dma_contig_cleanup_ctx(dev->alloc_ctx);
 	dev->alloc_ctx = NULL;
+#endif
 }
 
 static int tw6869_video_register(struct tw6869_dev *dev)
@@ -1434,6 +1482,7 @@ static int tw6869_video_register(struct tw6869_dev *dev)
 	if (ret)
 		return ret;
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,4,0)
 	dev->alloc_ctx = vb2_dma_contig_init_ctx(&pdev->dev);
 	if (IS_ERR(dev->alloc_ctx)) {
 		ret = PTR_ERR(dev->alloc_ctx);
@@ -1442,6 +1491,7 @@ static int tw6869_video_register(struct tw6869_dev *dev)
 		dev->alloc_ctx = NULL;
 		return ret;
 	}
+#endif
 
 	for (i = 0; i < TW_CH_MAX; i++) {
 		struct tw6869_vch *vch = &dev->vch[ID2CH(i)];
