@@ -23,6 +23,7 @@
  * SOFTWARE.
  */
 
+#include <linux/version.h>
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -77,6 +78,7 @@ MODULE_VERSION("0.3.3");
 #if !TRACE_SIZE
 #define DP_PRINT(FMT,...)
 #else
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,4,0)
 #define DP_PRINT(FMT,...) \
 	if (ramdp.buf) {\
 		uint32_t __len; \
@@ -103,6 +105,34 @@ MODULE_VERSION("0.3.3");
 	} else { \
 		pr_notice("[" TW_NAME ":%s:%d] " FMT, __func__, __LINE__,##__VA_ARGS__); \
 	}
+#else
+#define DP_PRINT(FMT,...) \
+	if (ramdp.buf) {\
+		uint32_t __len; \
+		unsigned long __flags;\
+		spin_lock_irqsave(&ramdp.lock, __flags); \
+		mb(); \
+		do { \
+			struct timespec64 tv; ktime_get_real_ts64(&tv); \
+			__len = snprintf(ramdp.buf + ramdp.tracePos, TRACE_SIZE - ramdp.tracePos, "%u:%lld.%06ld:%c:" FMT,\
+					ramdp.traceCount, tv.tv_sec, tv.tv_nsec/1000, (in_interrupt() ? 'I' : ((in_atomic() ? 'A' : 'N'))),\
+##__VA_ARGS__); \
+			if (__len + ramdp.tracePos >= TRACE_SIZE) {\
+				ramdp.written += (TRACE_SIZE - ramdp.tracePos);\
+				ramdp.tracePos = 0;\
+			} else { \
+				ramdp.tracePos += __len;\
+				ramdp.written += __len;\
+			} \
+		} while (0 == ramdp.tracePos && __len < TRACE_SIZE); \
+		ramdp.traceCount += 1;\
+		ramdp.pos = ramdp.buf + ramdp.tracePos;\
+		mb(); \
+		spin_unlock_irqrestore(&ramdp.lock, __flags); \
+	} else { \
+		pr_notice("[" TW_NAME ":%s:%d] " FMT, __func__, __LINE__,##__VA_ARGS__); \
+	}
+#endif
 
 struct ramdp_handle_t {
 	uint8_t buf[TRACE_SIZE];
@@ -245,7 +275,7 @@ struct tw6869_dev {
 	unsigned     dma_error_mask;	      /* DMA mask to ign errors after reset */
 	unsigned     dma_ok;	          /* DMA mask to ign errors after reset */
 	ktime_t      dma_error_ts[TW_CH_MAX]; /* DMA error timestamp per channel */
-	struct timer_list dma_resync;         /* DMA resync timer */
+	struct timer_list dma_resync_timer;         /* DMA resync timer */
 	unsigned pb_sts;
 #ifdef LAST_ENABLE
 	unsigned int dma_last_enable;
@@ -656,7 +686,7 @@ static irqreturn_t tw6869_irq(int irq, void *dev_id)
 		spin_unlock_irqrestore(&dev->rlock, flags);
 		TWNOTICE("dma disable to %02X errs: %02X\n", dev->dma_enable, errBits);
 #endif /* IRQ_DMA_STOP */
-		mod_timer(&dev->dma_resync, jiffies + msecs_to_jiffies(5));
+		mod_timer(&dev->dma_resync_timer, jiffies + msecs_to_jiffies(5));
 	}
 
 	diff = ktime_us_delta(ktime_get(), now);
@@ -1433,6 +1463,10 @@ static int tw6869_vch_register(struct tw6869_vch *vch)
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
 	vdev->debug = 0;
 #endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
+	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE |
+			    V4L2_CAP_STREAMING | V4L2_CAP_READWRITE;
+#endif
 	video_set_drvdata(vdev, vch);
 	ret = video_register_device(vdev, VFL_TYPE_GRABBER, -1);
 	if (!ret) {
@@ -1766,9 +1800,15 @@ snd_error:
 
 
 /* periodic DMA reset observer */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,4,0)
 static void dma_resync(unsigned long data)
 {
 	struct tw6869_dev *dev = (struct tw6869_dev* )data;
+#else
+static void dma_resync(struct timer_list *t)
+{
+	struct tw6869_dev *dev = from_timer(dev, t, dma_resync_timer);
+#endif
 	unsigned mask;
 	unsigned long flags;
 	ktime_t now = ktime_get();
@@ -1832,7 +1872,7 @@ static void dma_resync(unsigned long data)
 				break;
 			}
 		}
-		mod_timer(&dev->dma_resync, jiffies + msecs_to_jiffies(20));
+		mod_timer(&dev->dma_resync_timer, jiffies + msecs_to_jiffies(20));
 	} else {
 #ifdef IRQ_DMA_STOP
 		TWINFO("enable %02X/%02X timer down\n", dev->dma_enable, dev->videoCap_ID);
@@ -1991,8 +2031,8 @@ static int tw6869_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		ramdp.proc_entry_cat = proc_create("tw_cat", 0, NULL, &ramdp_fops);
 		if (NULL == ramdp.proc_entry_cat) {
 				pr_info("Creating /proc/tw_cat failed.\n");
-				ret = -ENODEV;
-				goto release_regs;
+//				ret = -ENODEV;
+//				goto release_regs;
 		}
 		ramdp.tracePos = 0;
 #endif
@@ -2027,10 +2067,14 @@ static int tw6869_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		dev->dma_last_enable = 0;
 #endif /* LAST_ENABLE */
 
-		init_timer(&dev->dma_resync);
-		dev->dma_resync.function = dma_resync;
-		dev->dma_resync.data = (unsigned long)dev;	///(unsigned long)(&dev);
-		mod_timer(&dev->dma_resync, jiffies + msecs_to_jiffies(30));
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,4,0)
+		init_timer(&dev->dma_resync_timer);
+		dev->dma_resync_timer.function = dma_resync;
+		dev->dma_resync_timer.data = (unsigned long)dev;	///(unsigned long)(&dev);
+#else
+		timer_setup(&dev->dma_resync_timer, dma_resync, 0);
+#endif
+		mod_timer(&dev->dma_resync_timer, jiffies + msecs_to_jiffies(30));
 
 		/* Allocate the interrupt */
 		ret = devm_request_irq(&pdev->dev, pdev->irq,
@@ -2078,7 +2122,7 @@ static void tw6869_remove(struct pci_dev *pdev)
 	struct tw6869_dev *dev =
 		container_of(v4l2_dev, struct tw6869_dev, v4l2_dev);
 
-	del_timer(&dev->dma_resync);
+	del_timer(&dev->dma_resync_timer);
 	device_remove_file(&dev->pdev->dev, &dev_attr_tw_reg);
 	remove_proc_entry("tw_cat", NULL);
 #ifdef IMPL_AUDIO
